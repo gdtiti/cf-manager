@@ -1,0 +1,163 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Build platforms'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+        type: string
+      push_images:
+        description: 'Push images to GHCR'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  DEFAULT_PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  docker:
+    name: Build and push Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve image names
+        id: images
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          repo="${repo,,}"
+
+          echo "backend=${REGISTRY}/${owner}/${repo}-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=${REGISTRY}/${owner}/${repo}-frontend" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build settings
+        id: settings
+        shell: bash
+        run: |
+          platforms="${{ inputs.platforms }}"
+          push_images="${{ inputs.push_images }}"
+
+          if [ -z "$platforms" ]; then
+            platforms="$DEFAULT_PLATFORMS"
+          fi
+
+          if [ -z "$push_images" ]; then
+            push_images="true"
+          fi
+
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "push_images=$push_images" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.settings.outputs.push_images == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Backend metadata
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.backend }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Frontend metadata
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.frontend }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Build and push backend image
+        id: build-backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./docker/backend/Dockerfile
+          platforms: ${{ steps.settings.outputs.platforms }}
+          push: ${{ steps.settings.outputs.push_images == 'true' }}
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Build and push frontend image
+        id: build-frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/frontend/Dockerfile
+          platforms: ${{ steps.settings.outputs.platforms }}
+          push: ${{ steps.settings.outputs.push_images == 'true' }}
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Docker image build"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Repository | \`${GITHUB_REPOSITORY}\` |"
+            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| Platforms | \`${{ steps.settings.outputs.platforms }}\` |"
+            echo "| Push to GHCR | \`${{ steps.settings.outputs.push_images }}\` |"
+            echo "| Backend image | \`${{ steps.images.outputs.backend }}\` |"
+            echo "| Backend digest | \`${{ steps.build-backend.outputs.digest }}\` |"
+            echo "| Frontend image | \`${{ steps.images.outputs.frontend }}\` |"
+            echo "| Frontend digest | \`${{ steps.build-frontend.outputs.digest }}\` |"
+            echo ""
+            echo "### Backend tags"
+            echo '```'
+            echo "${{ steps.meta-backend.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "### Frontend tags"
+            echo '```'
+            echo "${{ steps.meta-frontend.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "### Pull by digest"
+            echo '```bash'
+            echo "docker pull ${{ steps.images.outputs.backend }}@${{ steps.build-backend.outputs.digest }}"
+            echo "docker pull ${{ steps.images.outputs.frontend }}@${{ steps.build-frontend.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
